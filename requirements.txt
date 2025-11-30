@@ -1,0 +1,14 @@
+pandas
+tqdm
+openai
+mistralai
+ollama
+backoff
+requests
+beautifulsoup4
+selenium
+webdriver-manager
+streamlit
+dateparser
+pydantic
+python-dotenv
