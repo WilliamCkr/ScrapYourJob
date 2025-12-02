@@ -146,9 +146,8 @@ def scrapping_page():
 
 
 def configuration_page():
-    # 🔄 Chemin du fichier de config
-    CONFIG_FILE = os.getenv("APP_CONFIG_FILE", "config.json")
-    DEFAULT_CONFIG_FILE = "config_default.json"
+    # 🔄 Chemin du fichier de config (profil courant)
+    CONFIG_FILE = os.getenv("APP_CONFIG_FILE", os.path.join("config", "default.json"))
 
     # 🧩 Charger la configuration actuelle
     def load_config():
@@ -199,16 +198,6 @@ def configuration_page():
     def save_config(config):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
-
-    # 🔁 Réinitialiser la configuration depuis config_default.json
-    def reset_config():
-        if os.path.exists(DEFAULT_CONFIG_FILE):
-            with open(DEFAULT_CONFIG_FILE, "r", encoding="utf-8") as f:
-                default_config = json.load(f)
-            save_config(default_config)
-            return True
-        else:
-            return False
 
     # 🔧 Interface utilisateur Streamlit
     st.title("🔧 Configuration du Scraper")
@@ -333,14 +322,6 @@ def configuration_page():
     with col1:
         st.write("")  # espace vide ou petit texte si tu veux
 
-    with col2:
-        if st.button("♻️ Réinitialiser la configuration", key="btn_reset_config"):
-            if reset_config():
-                st.success("Configuration réinitialisée depuis config_default.json.")
-                st.rerun()
-            else:
-                st.error("Fichier config_default.json introuvable.")
-
     # ✅ Sauvegarde automatique de TOUTE la configuration
     save_config(config)
 
@@ -349,6 +330,7 @@ def configuration_page():
 # Page NOUVELLES OFFRES (avec Précédent / Suivant / Postuler)
 # ------------------------------------------------------------------
 def new_offer_page(df):
+    # Config du profil courant (contient les catégories choisies pour l’analyse IA)
     CONFIG_FILE = os.getenv("APP_CONFIG_FILE", "config.json")
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -359,6 +341,7 @@ def new_offer_page(df):
 
     st.title("📌 Offres pertinentes")
 
+    # Offres non lues et retenues par l’IA
     unread_jobs = df[
         (df.get("is_read", 0) == 0) & (df.get("is_good_offer", 0) == 1)
     ]
@@ -368,12 +351,14 @@ def new_offer_page(df):
 
     unread_jobs = unread_jobs.copy()
 
+    # Petite fonction utilitaire pour retrouver une colonne à partir d’un bout de nom
     def find_col(name_part: str):
         for c in categories:
             if name_part in c.lower() and c in df.columns:
                 return c
         return None
 
+    # On garde quand même ces colonnes pour le tri + synthèse
     tele_col = find_col("télétravail") or find_col("teletravail")
     sal_col = find_col("salaire")
     loc_col = find_col("localisation")
@@ -384,72 +369,75 @@ def new_offer_page(df):
             break
     av_col = find_col("avantage")
 
-    # ------------------- Filtres avancés ------------------- #
+    # ------------------- Filtres avancés (100% dynamiques) ------------------- #
     st.subheader("🎯 Filtres avancés")
-    col_f1, col_f2 = st.columns(2)
 
-    with col_f1:
-        if tele_col:
-            tele_order = [
-                "Full remote",
-                "4-5j",
-                "3j",
-                "2j",
-                "1j",
-                "0j",
-                "Occasionnel",
-                "Inconnu",
+    if categories:
+        cols = st.columns(2)
+        for idx, cat in enumerate(categories):
+            col_name = cat if cat in df.columns else None
+            if not col_name:
+                continue
+
+            # Valeurs présentes dans cette colonne
+            present = [
+                v for v in df[col_name].dropna().unique() if str(v).strip() != ""
             ]
-            present = sorted(df[tele_col].dropna().unique())
-            tele_options = [o for o in tele_order if o in present]
-            tele_selected = st.multiselect("Télétravail", tele_options)
-            if tele_selected:
-                unread_jobs = unread_jobs[unread_jobs[tele_col].isin(tele_selected)]
+            if not present:
+                continue
 
-    with col_f2:
-        if sal_col:
-            salary_order = [
-                "<30k",
-                "30-40k",
-                "40-50k",
-                "50-60k",
-                "60-70k",
-                ">70k",
-                "Inconnu",
-            ]
-            present = sorted(df[sal_col].dropna().unique())
-            salary_options = [o for o in salary_order if o in present]
-            sal_selected = st.multiselect("Salaire (fourchettes)", salary_options)
-            if sal_selected:
-                unread_jobs = unread_jobs[unread_jobs[sal_col].isin(sal_selected)]
+            norm = cat.lower()
+            options = sorted(present)
 
-    col_f3, col_f4 = st.columns(2)
+            # Ordres “intelligents” pour certains types connus, sinon tri alpha
+            if "télétravail" in norm or "teletravail" in norm:
+                order = [
+                    "Full remote",
+                    "4-5j",
+                    "3j",
+                    "2j",
+                    "1j",
+                    "0j",
+                    "Occasionnel",
+                    "Inconnu",
+                ]
+                options = [o for o in order if o in present]
+            elif "salaire" in norm or "rémunération" in norm:
+                order = [
+                    "<30k",
+                    "30-40k",
+                    "40-50k",
+                    "50-60k",
+                    "60-70k",
+                    ">70k",
+                    "Inconnu",
+                ]
+                options = [o for o in order if o in present]
+            elif "localisation" in norm or "lieu" in norm:
+                order = ["Ile-de-France", "Province", "Remote", "Etranger", "Inconnu"]
+                options = [o for o in order if o in present]
+            elif "ticket" in norm and "rest" in norm:
+                order = ["Oui", "Non", "Inconnu"]
+                options = [o for o in order if o in present]
+            elif "avantage" in norm:
+                order = [
+                    "Mutuelle+Transport",
+                    "Mutuelle",
+                    "Transport",
+                    "Autres",
+                    "Inconnu",
+                ]
+                options = [o for o in order if o in present]
 
-    with col_f3:
-        if loc_col:
-            loc_order = ["Ile-de-France", "Province", "Remote", "Etranger", "Inconnu"]
-            present = sorted(df[loc_col].dropna().unique())
-            loc_options = [o for o in loc_order if o in present]
-            loc_selected = st.multiselect("Localisation", loc_options)
-            if loc_selected:
-                unread_jobs = unread_jobs[unread_jobs[loc_col].isin(loc_selected)]
-
-    with col_f4:
-        if tick_col:
-            tick_order = ["Oui", "Non", "Inconnu"]
-            present = sorted(df[tick_col].dropna().unique())
-            tick_options = [o for o in tick_order if o in present]
-            tick_selected = st.multiselect("Tickets restaurant", tick_options)
-            if tick_selected:
-                unread_jobs = unread_jobs[unread_jobs[tick_col].isin(tick_selected)]
-
-    if av_col:
-        adv_order = ["Mutuelle+Transport", "Mutuelle", "Transport", "Autres", "Inconnu"]
-        present = sorted(df[av_col].dropna().unique())
-        adv_options = [o for o in adv_order if o in present]
-        adv_selected = st.multiselect("Avantages principaux", adv_options)
-        if adv_selected:
-            unread_jobs = unread_jobs[unread_jobs[av_col].isin(adv_selected)]
+            col = cols[idx % 2]
+            with col:
+                selected = st.multiselect(
+                    cat,
+                    options,
+                    key=f"filter_cat_{idx}",
+                )
+                if selected:
+                    unread_jobs = unread_jobs[unread_jobs[col_name].isin(selected)]
 
     # ------------------- Tri ------------------- #
     st.subheader("📊 Tri des offres")
@@ -534,19 +522,15 @@ def new_offer_page(df):
             unsafe_allow_html=True,
         )
 
+    # ------------------- Synthèse IA dynamique ------------------- #
     if categories:
-        with st.expander("🧩 Synthèse IA (télétravail, salaire, etc.)"):
-            if tele_col and tele_col in job:
-                st.write(f"- **Télétravail** : {job.get(tele_col, 'Inconnu')}")
-            if sal_col and sal_col in job:
-                st.write(f"- **Salaire** : {job.get(sal_col, 'Inconnu')}")
-            if loc_col and loc_col in job:
-                st.write(f"- **Localisation** : {job.get(loc_col, 'Inconnu')}")
-            if tick_col and tick_col in job:
-                st.write(f"- **Tickets resto** : {job.get(tick_col, 'Inconnu')}")
-            if av_col and av_col in job:
-                st.write(f"- **Avantages** : {job.get(av_col, 'Inconnu')}")
+        with st.expander("🧩 Synthèse IA (catégories analysées)"):
+            for cat in categories:
+                if cat in job.index:
+                    val = job.get(cat, "Inconnu")
+                    st.write(f"- **{cat}** : {val}")
 
+    # ------------------- Description + actions ------------------- #
     with st.expander("📄 Description de l'offre"):
         st.write(job.get("content", ""))
         if isinstance(job.get("comment"), str) and job["comment"].strip():
@@ -554,7 +538,6 @@ def new_offer_page(df):
             st.markdown("**Commentaire IA :**")
             st.write(job["comment"])
 
-    # Boutons navigation + actions
     col_prev, col_mark, col_refuse, col_next = st.columns(4)
 
     with col_prev:
@@ -585,7 +568,6 @@ def new_offer_page(df):
             st.session_state.index = (st.session_state.index + 1) % total_jobs
             st.rerun()
 
-    # Bouton Postuler centré
     col_left, col_center, col_right = st.columns([1, 1, 1])
     with col_center:
         if st.button("📎 Postuler"):
@@ -595,6 +577,7 @@ def new_offer_page(df):
                 st.session_state.index, max(total_jobs - 2, 0)
             )
             st.rerun()
+
 
 
 # ------------------------------------------------------------------
@@ -655,6 +638,7 @@ def offer_gpt_filter_page(df):
 def category_analysis_page(df):
     CONFIG_FILE = os.getenv("APP_CONFIG_FILE", "config.json")
 
+    # Chargement config profil courant
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             config = json.load(f)
@@ -665,19 +649,29 @@ def category_analysis_page(df):
 
     st.title("🎯 Analyse IA des catégories")
 
+    # -----------------------------
+    # Catégories à extraire (AUTO-SAVE)
+    # -----------------------------
     st.subheader("📝 Catégories à extraire")
     categories_text = st.text_area(
         "Entrez une catégorie par ligne (ex : Télétravail, Salaire, Localisation, Tickets restaurant, etc.)",
         value="\n".join(categories),
         height=120,
+        key="categories_ia_textarea",
     )
-    categories = [c.strip() for c in categories_text.splitlines() if c.strip()]
 
-    if st.button("💾 Sauvegarder les catégories"):
+    new_categories = [c.strip() for c in categories_text.splitlines() if c.strip()]
+
+    # Sauvegarde automatique si changement
+    if new_categories != categories:
+        categories = new_categories
         config["categories"] = categories
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-        st.success("Catégories sauvegardées. Vous pouvez lancer l'analyse juste en dessous.")
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            st.caption("💾 Catégories sauvegardées automatiquement.")
+        except Exception as e:
+            st.error(f"Erreur lors de la sauvegarde des catégories : {e}")
 
     st.markdown("---")
     st.subheader("🤖 Analyse IA des offres retenues")
@@ -702,6 +696,8 @@ def category_analysis_page(df):
 
         for i, (idx, row) in enumerate(good_jobs.iterrows(), start=1):
             values = analyze_categories_for_row(row, llm_config, categories)
+
+            # on écrit directement dans le DF complet
             for cat, val in values.items():
                 if cat not in df.columns:
                     df[cat] = ""
@@ -716,6 +712,8 @@ def category_analysis_page(df):
         st.success(
             "Analyse IA terminée ! Les nouvelles colonnes de catégories sont maintenant disponibles pour les filtres."
         )
+
+
 
 
 def offer_readed_page(df):

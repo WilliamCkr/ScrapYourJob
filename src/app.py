@@ -14,38 +14,86 @@ from application.all_pages_app import (
     category_analysis_page,
 )
 
-PROFILES_FILE = "profiles.json"
+# Fichier de définition des profils (à la racine)
+PROFILES_FILE = ".profiles.json"
 
 
 # ---------- Gestion des profils ---------- #
+
 
 def _slugify(label: str) -> str:
     base = re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
     return base or "profil"
 
 
+def _get_default_profile() -> dict:
+    """Profil par défaut, utilisé uniquement quand aucun autre profil n'existe."""
+    return {
+        "id": "default",
+        "label": "Profil par défaut",
+        "data_file": os.path.join("data", "default.csv"),
+        "config_file": os.path.join("config", "default.json"),
+        "created_at": None,
+    }
+
+
 def load_profiles():
-    """Lit profiles.json et renvoie une liste de profils."""
-    if not os.path.exists(PROFILES_FILE):
+    """Lit .profiles.json (ou l'ancien profiles.json) et renvoie la liste des profils utilisateur."""
+    profiles_path = PROFILES_FILE
+
+    # Compat : si .profiles.json n'existe pas encore mais profiles.json oui
+    if not os.path.exists(profiles_path) and os.path.exists("profiles.json"):
+        profiles_path = "profiles.json"
+
+    if not os.path.exists(profiles_path):
         return []
 
-    with open(PROFILES_FILE, "r", encoding="utf-8") as f:
+    with open(profiles_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    # Format actuel : {"profiles": [ ... ]}
-    if isinstance(data, dict) and "profiles" in data and isinstance(data["profiles"], list):
-        return data["profiles"]
+    # Format actuel : { "profiles": [ ... ] }
+    if isinstance(data, dict) and isinstance(data.get("profiles"), list):
+        profiles = data["profiles"]
+    # Ancien format : liste directe
+    elif isinstance(data, list):
+        profiles = data
+    else:
+        profiles = []
 
-    # Format de secours : directement une liste
-    if isinstance(data, list):
-        return data
+    # Normalisation des chemins (tout dans data/ et config/)
+    changed = False
+    for p in profiles:
+        # config_file
+        if "config_file" in p and p["config_file"]:
+            cf = str(p["config_file"]).replace("\\", "/")
+            base = os.path.basename(cf)
+            # Ancien nom du type config_william.json -> william.json
+            if base.startswith("config_"):
+                base = base[len("config_") :]
+            if not cf.startswith("config/"):
+                cf = os.path.join("config", base)
+            if cf != p["config_file"]:
+                p["config_file"] = cf
+                changed = True
 
-    # Sinon on repart de zéro
-    return []
+        # data_file
+        if "data_file" in p and p["data_file"]:
+            df = str(p["data_file"]).replace("\\", "/")
+            base = os.path.basename(df)
+            if not df.startswith("data/"):
+                df = os.path.join("data", base)
+            if df != p["data_file"]:
+                p["data_file"] = df
+                changed = True
+
+    if changed:
+        save_profiles(profiles)
+
+    return profiles
 
 
 def save_profiles(profiles):
-    """Sauvegarde la liste de profils dans profiles.json au format {"profiles": [...]}."""
+    """Sauvegarde la liste de profils dans .profiles.json au format {"profiles": [...]}"""
     with open(PROFILES_FILE, "w", encoding="utf-8") as f:
         json.dump({"profiles": profiles}, f, ensure_ascii=False, indent=2)
 
@@ -127,11 +175,17 @@ def ensure_profile_files(profile):
 
 
 def create_profile(label: str) -> dict:
+    """Crée un nouveau profil utilisateur (nom 'default' interdit)."""
+    if label.strip().lower() == "default":
+        raise ValueError("Le nom 'default' est réservé et ne peut pas être utilisé.")
+
     profiles = load_profiles()
     slug = _slugify(label)
 
     # Éviter de réutiliser un id déjà existant
     existing_ids = {p["id"] for p in profiles}
+    existing_ids.add("default")  # réserve aussi l'id interne du profil par défaut
+
     base_id = slug
     i = 1
     while slug in existing_ids:
@@ -158,54 +212,66 @@ def create_profile(label: str) -> dict:
 
 # ---------- Chargement / sélection du profil ---------- #
 
+
 st.set_page_config(page_title="Gestion des candidatures", layout="wide")
 
 st.sidebar.title("Profils")
 
 profiles = load_profiles()
+use_default_profile = len(profiles) == 0
 
-# Si ton ancien fichier avait déjà un profil william, on le garde tel quel
-if not profiles:
-    # Créer un profil par défaut
-    default_profile = create_profile("Profil par défaut")
-    profiles = [default_profile]
-
-profile_labels = [p["label"] for p in profiles]
-current_label = st.sidebar.selectbox("Profil courant", profile_labels)
-
-current_profile = next(p for p in profiles if p["label"] == current_label)
+if use_default_profile:
+    # Aucun profil utilisateur -> profil par défaut (non listé, non supprimable)
+    current_profile = _get_default_profile()
+    ensure_profile_files(current_profile)
+    st.sidebar.markdown("Profil actuel : **Profil par défaut**")
+else:
+    profile_labels = [p["label"] for p in profiles]
+    current_label = st.sidebar.selectbox("Profil courant", profile_labels)
+    current_profile = next(p for p in profiles if p["label"] == current_label)
 
 # Boutons de gestion des profils
 with st.sidebar.expander("Créer / gérer les profils"):
-    new_label = st.text_input("Nom du nouveau profil")
+    # Création
+    new_label = st.text_input("Nom du nouveau profil", key="new_profile_label")
     if st.button("Créer le profil"):
         if new_label.strip():
-            prof = create_profile(new_label.strip())
-            st.sidebar.success(f"Profil '{prof['label']}' créé.")
-            st.rerun()
+            if new_label.strip().lower() == "default":
+                st.sidebar.error("Le nom 'default' est réservé, choisis un autre nom.")
+            else:
+                try:
+                    prof = create_profile(new_label.strip())
+                    st.sidebar.success(f"Profil '{prof['label']}' créé.")
+                    st.rerun()
+                except ValueError as e:
+                    st.sidebar.error(str(e))
         else:
             st.sidebar.error("Le nom du profil ne peut pas être vide.")
 
-    # Renommer le profil courant
-    rename_label = st.text_input("Renommer le profil courant", value=current_profile["label"])
-    if st.button("Renommer ce profil"):
-        if rename_label.strip():
-            for p in profiles:
-                if p["id"] == current_profile["id"]:
-                    p["label"] = rename_label.strip()
-            save_profiles(profiles)
-            st.sidebar.success("Profil renommé.")
-            st.rerun()
-        else:
-            st.sidebar.error("Le nom du profil ne peut pas être vide.")
+    # Renommage / suppression uniquement si on n'est pas sur le profil par défaut
+    if not use_default_profile:
+        rename_label = st.text_input(
+            "Renommer le profil courant",
+            value=current_profile["label"],
+            key="rename_profile_label",
+        )
+        if st.button("Renommer ce profil"):
+            if rename_label.strip():
+                if rename_label.strip().lower() == "default":
+                    st.sidebar.error("Le nom 'default' est réservé, choisis un autre nom.")
+                else:
+                    for p in profiles:
+                        if p["id"] == current_profile["id"]:
+                            p["label"] = rename_label.strip()
+                    save_profiles(profiles)
+                    st.sidebar.success("Profil renommé.")
+                    st.rerun()
+            else:
+                st.sidebar.error("Le nom du profil ne peut pas être vide.")
 
-    # Supprimer le profil courant
-    if st.button("Supprimer ce profil"):
-        if len(profiles) == 1:
-            st.sidebar.error("Impossible de supprimer le dernier profil.")
-        else:
+        if st.button("Supprimer ce profil"):
             prof = current_profile
-            # Supprimer les fichiers associés
+
             if os.path.exists(prof["data_file"]):
                 os.remove(prof["data_file"])
             if os.path.exists(prof["config_file"]):
@@ -216,7 +282,7 @@ with st.sidebar.expander("Créer / gérer les profils"):
             st.sidebar.success(f"Profil '{prof['label']}' supprimé.")
             st.rerun()
 
-# S'assurer que les fichiers du profil courant existent
+# S'assurer que les fichiers du profil courant existent (sécurité)
 ensure_profile_files(current_profile)
 
 # Définir les variables d'environnement pour le reste de l'app
@@ -264,10 +330,8 @@ def load_data():
     return df
 
 
-# Charger les données du profil sélectionné
-df = load_data()
-
 # ---------- Navigation ---------- #
+
 
 st.sidebar.markdown("---")
 st.sidebar.title("Navigation")
@@ -283,6 +347,8 @@ page = st.sidebar.radio(
         "Analyse IA avancée",
     ),
 )
+
+df = load_data()
 
 if page == "Scraping d'offres":
     scrapping_page()

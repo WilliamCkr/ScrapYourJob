@@ -1,2 +1,6 @@
 .idea
 /data/
+.venv
+config/william.json
+config/jixin.json
+.profiles.json
