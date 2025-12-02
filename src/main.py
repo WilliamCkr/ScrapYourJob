@@ -50,10 +50,13 @@ def get_all_job(progress_dict, all_platforms, is_multiproc):
     return pd.concat(results, ignore_index=True)
 
 def merge_dataframes(progress_dict, stored_df, new_df, config):
-    """
-    Ajoute les nouvelles entrées du new_df à stored_df en vérifiant l'unicité
-    et en alimentant les white/black lists d'ID.
-    Retourne (merged_df, config_mis_a_jour).
+    """Fusionne les nouvelles offres dans le store et met à jour les listes d'ID.
+
+    - Supprime d'emblée les offres présentes dans la blacklist.
+    - Vérifie l'unicité à partir du hash, du lien **et** de l'``offer_id`` afin
+      d'éviter les doublons même si le contenu évolue.
+    - Applique le scoring LLM si activé et alimente les white/black lists.
+    - Retourne ``(merged_df, config_mis_a_jour)``.
     """
 
     # --- Préparation config / LLM --- #
@@ -84,9 +87,26 @@ def merge_dataframes(progress_dict, stored_df, new_df, config):
         elif llm_config.get("provider") == "Local":
             client = None
 
+    # Prévenir toute mutation surprise de la source
+    new_df = new_df.copy()
+
     # --- Filtrage immédiat des nouvelles offres par blacklist --- #
     if "offer_id" in new_df.columns:
         new_df = new_df[~new_df["offer_id"].isin(blacklisted_ids)].copy()
+
+    def update_id_lists(src, offer_id, score, is_good):
+        if not offer_id or src not in platform_keys:
+            return
+        if not llm_config.get("generate_score"):
+            return
+
+        if score >= SCORE_THRESHOLD and is_good == 1:
+            if offer_id not in id_whitelist[src]:
+                id_whitelist[src].append(offer_id)
+            if offer_id in id_blacklist[src]:
+                id_blacklist[src].remove(offer_id)
+        elif score < SCORE_THRESHOLD and offer_id not in id_blacklist[src]:
+            id_blacklist[src].append(offer_id)
 
     # --- Cas où le store est vide --- #
     if stored_df.empty:
@@ -96,42 +116,41 @@ def merge_dataframes(progress_dict, stored_df, new_df, config):
                 lambda row: add_LLM_comment(client, llm_config, row), axis=1
             )
 
-            # Mise à jour white/black list pour toutes les lignes scorées
-            from scraping.utils import SCORE_THRESHOLD  # éviter import en tête si besoin
-
             for _, row in new_df.iterrows():
-                src = str(row.get("source", "")).lower()
-                offer_id = row.get("offer_id")
-                score = row.get("score", 0)
-                is_good = row.get("is_good_offer", 0)
-
-                if not offer_id or src not in platform_keys:
-                    continue
-
-                if llm_config.get("generate_score"):
-                    if score >= SCORE_THRESHOLD and is_good == 1:
-                        if offer_id not in id_whitelist[src]:
-                            id_whitelist[src].append(offer_id)
-                    elif score < SCORE_THRESHOLD:
-                        if offer_id not in id_blacklist[src]:
-                            id_blacklist[src].append(offer_id)
+                update_id_lists(
+                    src=str(row.get("source", "")).lower(),
+                    offer_id=row.get("offer_id"),
+                    score=row.get("score", 0),
+                    is_good=row.get("is_good_offer", 0),
+                )
 
         return new_df, config
 
     # --- Filtrer les nouvelles lignes déjà présentes dans stored_df --- #
     new_rows = []
-    existing_hashes = set(stored_df.get("hash", []))
-    existing_links = set(stored_df.get("link", []))
+    existing_hashes = set(stored_df.get("hash", pd.Series([], dtype=str)).astype(str))
+    existing_links = set(stored_df.get("link", pd.Series([], dtype=str)).astype(str))
+    existing_offer_ids = set(
+        stored_df.get("offer_id", pd.Series([], dtype=str))
+        .dropna()
+        .astype(str)
+    )
 
     for _, new_row in new_df.iterrows():
-        h = new_row.get("hash")
-        link = new_row.get("link")
-        if h not in existing_hashes and link not in existing_links:
-            new_rows.append(new_row)
+        row = new_row.copy()
+        hash_val = str(row.get("hash", ""))
+        link = str(row.get("link", ""))
+        offer_id = row.get("offer_id")
+        offer_id_str = str(offer_id) if pd.notna(offer_id) else None
+
+        if hash_val in existing_hashes or link in existing_links:
+            continue
+        if offer_id_str and offer_id_str in existing_offer_ids:
+            continue
+
+        new_rows.append(row)
 
     # --- Scoring + alimentation white/black list --- #
-    from scraping.utils import SCORE_THRESHOLD  # pour seuil 65
-
     for i, new_row in tqdm(
         list(enumerate(new_rows)),
         total=len(new_rows),
@@ -139,30 +158,18 @@ def merge_dataframes(progress_dict, stored_df, new_df, config):
     ):
         if use_llm:
             new_rows[i] = add_LLM_comment(client, llm_config, new_row)
+            progress_dict["Traitement des nouvelles offres (LLM)"] = (
+                i + 1,
+                len(new_rows),
+            )
 
-        # Mise à jour LLM progress
-        progress_dict["Traitement des nouvelles offres (LLM)"] = (
-            i + 1,
-            len(new_rows),
-        )
-
-        # Mise à jour white/black lists
         row = new_rows[i]
-        src = str(row.get("source", "")).lower()
-        offer_id = row.get("offer_id")
-        score = row.get("score", 0)
-        is_good = row.get("is_good_offer", 0)
-
-        if not offer_id or src not in platform_keys:
-            continue
-
-        if llm_config.get("generate_score"):
-            if score >= SCORE_THRESHOLD and is_good == 1:
-                if offer_id not in id_whitelist[src]:
-                    id_whitelist[src].append(offer_id)
-            elif score < SCORE_THRESHOLD:
-                if offer_id not in id_blacklist[src]:
-                    id_blacklist[src].append(offer_id)
+        update_id_lists(
+            src=str(row.get("source", "")).lower(),
+            offer_id=row.get("offer_id"),
+            score=row.get("score", 0),
+            is_good=row.get("is_good_offer", 0),
+        )
 
     # --- Fusion finale avec le store --- #
     if new_rows:

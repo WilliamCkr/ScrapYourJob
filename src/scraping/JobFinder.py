@@ -1,6 +1,7 @@
-import requests
-import pandas as pd
 import hashlib
+
+import pandas as pd
+import requests
 
 
 def generate_offer_id(plateforme: str, link: str) -> str:
