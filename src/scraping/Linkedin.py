@@ -78,10 +78,13 @@ class Linkedin(JobFinder):
 
     @measure_time
     def getJob(self, update_callback=None):
-        """Récupère les offres LinkedIn via l'API jobs-guest."""
+        """Récupère les offres LinkedIn via l'API jobs-guest + détail via jobPosting (anti-429)."""
         if not self.job_id_api:
             print("LinkedIn : configuration invalide ou incomplète, aucun scraping effectué.")
             return self._empty_df()
+
+        import re
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         all_jobs = []
         seen_links = set()
@@ -115,27 +118,23 @@ class Linkedin(JobFinder):
             new_jobs = 0
             for card in cards:
                 try:
-                    # Lien vers la fiche
                     link_el = (
                         card.select_one("a.base-card__full-link")
                         or card.select_one("a.job-card-container__link.job-card-list__title--link")
                         or card.select_one("a.job-card-container__link")
                     )
 
-                    # Titre de l'offre
                     title_el = (
                         card.select_one("h3.base-search-card__title")
                         or card.select_one("a.job-card-container__link.job-card-list__title--link span")
                         or card.select_one("a.job-card-container__link")
                     )
 
-                    # Nom de l’entreprise
                     company_el = (
                         card.select_one("h4.base-search-card__subtitle")
                         or card.select_one("div.artdeco-entity-lockup__subtitle span")
                     )
 
-                    # Date de publication (si dispo)
                     date_el = card.select_one("time")
 
                     link = (
@@ -155,6 +154,7 @@ class Linkedin(JobFinder):
                         seen_links.add(link)
                         all_jobs.append((title, company, link, date_str))
                         new_jobs += 1
+
                 except Exception as e:
                     print(f"LinkedIn : erreur parsing carte : {e}")
 
@@ -198,27 +198,84 @@ class Linkedin(JobFinder):
         if total == 0:
             return self._empty_df()
 
-        # --- 2) Récupération du détail de chaque fiche (en parallèle) ---
+        # --- 2) Détail via endpoint "jobPosting" (évite /jobs/view -> 429) ---
+        JOB_POSTING_API = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{}"
+
+        def _extract_job_id(url: str):
+            # ex: https://fr.linkedin.com/jobs/view/...-4343017460
+            m = re.search(r"-([0-9]{6,})$", url)
+            return m.group(1) if m else None
+
+        @backoff.on_exception(
+            backoff.expo,
+            (HTTPError, RequestException),
+            max_tries=5,
+            jitter=backoff.full_jitter,
+        )
+        def _get_detail(url: str) -> str:
+            time.sleep(random.uniform(1.2, 2.8))  # anti-rate-limit
+            r = requests.get(url, headers=self.headers, timeout=20)
+            r.raise_for_status()
+            return r.text
+
         def _fetch_detail(job):
             title, company, link, date_str = job
-            description = ""
+
+            job_id = _extract_job_id(link)
+            if not job_id:
+                print(f"LinkedIn : job_id introuvable dans {link}")
+                return None
+
+            detail_url = JOB_POSTING_API.format(job_id)
+
             try:
-                resp = requests.get(link, headers=self.headers, timeout=15)
-                if resp.ok:
-                    soup = BeautifulSoup(resp.text, "html.parser")
-                    desc_el = (
-                        soup.select_one("div.show-more-less-html__markup")
-                        or soup.select_one("div.description__text")
-                        or soup.select_one("div.jobs-description__content")
-                    )
-                    if desc_el:
-                        description = desc_el.get_text(" ", strip=True)
+                html = _get_detail(detail_url)
+            except HTTPError as e:
+                status = getattr(e.response, "status_code", None)
+                if status == 429:
+                    print(f"LinkedIn : 429 sur {detail_url} (rate limit), on skip.")
+                    return None
+                print(f"LinkedIn : HTTP error {status} sur {detail_url} : {e}")
+                return None
             except Exception as e:
-                print(f"LinkedIn : erreur lors de la récupération du détail d'une offre : {e}")
+                print(f"LinkedIn : erreur récupération détail {detail_url} : {e}")
+                return None
+
+            soup = BeautifulSoup(html, "html.parser")
+            desc_el = (
+                soup.select_one("div.show-more-less-html__markup")
+                or soup.select_one("div.jobs-description__content")
+                or soup.select_one("section.description")
+                or soup.select_one("div.description__text")
+            )
+
+            description = desc_el.get_text(" ", strip=True) if desc_el else ""
+            if not description.strip():
+                print(f"LinkedIn : aucune description trouvée pour {link}, offre ignorée.")
+                return None
 
             return title, company, link, date_str, description
 
-        detailed_jobs = parallel_map_offers(all_jobs, _fetch_detail, io_bound=True)
+        # ⚠️ IMPORTANT : limiter le parallélisme (sinon 429)
+        max_workers = 2  # tu peux mettre 2 si ça passe, mais 1 = le plus safe
+        print(f"[SCRAP] LinkedIn détails avec {max_workers} worker(s)")
+
+        detailed_jobs = []
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_fetch_detail, job) for job in all_jobs]
+            done = 0
+            for f in as_completed(futures):
+                r = f.result()
+                if r is not None:
+                    detailed_jobs.append(r)
+
+                done += 1
+                if update_callback:
+                    update_callback(done, total)
+
+        if not detailed_jobs:
+            print("LinkedIn : aucun détail d'offre récupéré.")
+            return self._empty_df()
 
         list_title = [t for (t, c, l, d, desc) in detailed_jobs]
         list_company = [c for (t, c, l, d, desc) in detailed_jobs]
@@ -226,15 +283,12 @@ class Linkedin(JobFinder):
         list_datetime = [d for (t, c, l, d, desc) in detailed_jobs]
         list_content = [desc for (t, c, l, d, desc) in detailed_jobs]
 
-        total = len(detailed_jobs)
-        for i in range(total):
-            print(f"Linkedin {i+1}/{total}")
-            if update_callback:
-                update_callback(i + 1, total)
-
-        df = self.formatData("linkedin", list_title, list_content, list_company, list_link, list_datetime)
+        df = self.formatData(
+            "linkedin", list_title, list_content, list_company, list_link, list_datetime
+        )
         df = df.drop_duplicates(subset="hash", keep="first")
         return df
+
 
 
 if __name__ == "__main__":

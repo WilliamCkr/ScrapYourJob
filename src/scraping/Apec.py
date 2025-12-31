@@ -129,7 +129,7 @@ class Apec(JobFinder):
                     print(f"APEC : erreur parsing d’une offre sur la page {page + 1} : {e}")
                     continue
 
-        # --- Filtrage avec white/black lists + offres déjà connues ---
+        # --- Filtrage avec white/black lists + offres déjà connues --- #
         config_path = os.getenv("APP_CONFIG_FILE", "config.json")
         csv_path = os.getenv("JOB_DATA_FILE", "data/job.csv")
 
@@ -174,10 +174,14 @@ class Apec(JobFinder):
                     )
                 )
                 job_description = job_description_element.text
-
             except Exception as e:
                 print(f"APEC : erreur lors de la récupération du détail {link} : {e}")
                 job_description = ""
+
+            # ⬇⬇⬇ on skip si pas de description exploitable
+            if not job_description.strip():
+                print(f"APEC : description vide pour {link}, offre ignorée.")
+                continue
 
             list_title.append(title)
             list_content.append(job_description)
@@ -196,6 +200,7 @@ class Apec(JobFinder):
         )
         df = df.drop_duplicates(subset="hash", keep="first")
         return df
+
 
     def _close_cookies(self, driver):
         """Ferme la bannière cookies si présente."""

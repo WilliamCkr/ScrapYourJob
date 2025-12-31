@@ -67,7 +67,7 @@ def _local_llm_generate_score(llm_config, row):
     description = row["content"]
 
     response = generate(
-        model="mistral:7b",
+        model="qwen2.5:14b-instruct-q4_K_M",
         options={"temperature": 0.1},
         format={
             "type": "object",
@@ -90,7 +90,7 @@ def _local_llm_generate_score(llm_config, row):
 def _local_llm_generate_profile(llm_config, row):
     """Génération du profil personnalisé (facultatif)."""
     response = generate(
-        model="mistral:7b",
+        model="qwen2.5:14b-instruct-q4_K_M",
         options={"temperature": 0.3},
         prompt=(
             llm_config["cv"]
@@ -123,7 +123,7 @@ def add_LLM_comment(client_LLM, llm_config, row):
             # Providers externes (ChatGPT, Mistral API...)
             elif llm_config["provider"] == "ChatGPT":
                 response = client_LLM.responses.parse(
-                    model="gpt-4o-mini",
+                    model="qwen2.5:14b-instruct-q4_K_M",
                     instructions=llm_config["prompt_score"],
                     temperature=0.1,
                     input=row["company"] + "\n" + row["title"] + "\n" + row["content"],
@@ -192,7 +192,7 @@ def analyze_categories_for_row(row, llm_config, categories):
         """
         try:
             response = generate(
-                model="mistral:7b",
+                model="qwen2.5:14b-instruct-q4_K_M",
                 options={"temperature": 0.1},
                 format={
                     "type": "object",

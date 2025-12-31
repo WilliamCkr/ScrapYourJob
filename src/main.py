@@ -26,6 +26,20 @@ class Platform(Enum):
 
 @measure_time
 def get_all_job(progress_dict, all_platforms, is_multiproc):
+    """
+    Lance les scrapers (multi-thread ou séquentiel) et retourne TOUJOURS un DataFrame.
+    Ne plante pas si une plateforme échoue.
+    """
+
+    def _empty_df():
+        return pd.DataFrame(
+            columns=[
+                "title", "content", "company", "link", "date",
+                "is_read", "is_apply", "is_refused", "is_good_offer",
+                "comment", "score", "custom_profile",
+                "hash", "offer_id", "source",
+            ]
+        )
 
     def run_source(source_class):
         name = source_class.__name__
@@ -35,9 +49,20 @@ def get_all_job(progress_dict, all_platforms, is_multiproc):
         def update_callback(current, total):
             progress_dict[name] = (current, total)
 
-        df = platform.getJob(update_callback=update_callback)
-        print(f"[SCRAP] Fin {name}")
-        return df
+        try:
+            df = platform.getJob(update_callback=update_callback)
+            if df is None:
+                print(f"[SCRAP][WARN] {name} a renvoyé None -> DF vide")
+                df = _empty_df()
+            print(f"[SCRAP] Fin {name} ({len(df)} offres)")
+            return df
+        except Exception as e:
+            print(f"[SCRAP][ERROR] {name} a échoué : {e}")
+            return _empty_df()
+
+    # Lancement
+    if not all_platforms:
+        return _empty_df()
 
     if is_multiproc and len(all_platforms) > 1:
         print(f"[SCRAP] Mode multi-thread ({len(all_platforms)} workers)")
@@ -47,16 +72,50 @@ def get_all_job(progress_dict, all_platforms, is_multiproc):
         print("[SCRAP] Mode séquentiel")
         results = [run_source(cls) for cls in all_platforms]
 
-    return pd.concat(results, ignore_index=True)
+    # Sécurité : jamais None
+    results = [df for df in results if df is not None]
 
-def merge_dataframes(progress_dict, stored_df, new_df, config):
+    if not results:
+        return _empty_df()
+
+    try:
+        return pd.concat(results, ignore_index=True)
+    except Exception as e:
+        print(f"[SCRAP][ERROR] concat impossible : {e}")
+        return _empty_df()
+
+
+    def run_source(source_class):
+        name = source_class.__name__
+        print(f"[SCRAP] Démarrage {name}")
+        platform = source_class()
+
+        def update_callback(current, total):
+            progress_dict[name] = (current, total)
+
+        try:
+            df = platform.getJob(update_callback=update_callback)
+            print(f"[SCRAP] Fin {name}")
+            return df
+        except Exception as e:
+            print(f"[SCRAP][ERROR] {name} a échoué : {e}")
+            import pandas as pd
+            return pd.DataFrame(
+                columns=[
+                    "title", "content", "company", "link", "date",
+                    "is_read", "is_apply", "is_refused", "is_good_offer",
+                    "comment", "score", "custom_profile",
+                    "hash", "offer_id", "source",
+                ]
+            )
+
     """Fusionne les nouvelles offres dans le store et met à jour les listes d'ID.
 
     - Supprime d'emblée les offres présentes dans la blacklist.
-    - Vérifie l'unicité à partir du hash, du lien **et** de l'``offer_id`` afin
-      d'éviter les doublons même si le contenu évolue.
+    - Supprime aussi toutes les offres sans description (content vide ou NaN).
+    - Vérifie l'unicité à partir du hash, du lien **et** de l'offer_id.
     - Applique le scoring LLM si activé et alimente les white/black lists.
-    - Retourne ``(merged_df, config_mis_a_jour)``.
+    - Retourne (merged_df, config_mis_a_jour).
     """
 
     # --- Préparation config / LLM --- #
@@ -90,9 +149,18 @@ def merge_dataframes(progress_dict, stored_df, new_df, config):
     # Prévenir toute mutation surprise de la source
     new_df = new_df.copy()
 
-    # --- Filtrage immédiat des nouvelles offres par blacklist --- #
+    # --- Nettoyage / filtrage de base sur les nouvelles offres --- #
+    # 1) supprimer celles qui sont en blacklist
     if "offer_id" in new_df.columns:
         new_df = new_df[~new_df["offer_id"].isin(blacklisted_ids)].copy()
+
+    # 2) normaliser la colonne content et supprimer les offres sans description
+    if "content" in new_df.columns:
+        new_df["content"] = new_df["content"].fillna("").astype(str)
+        new_df = new_df[new_df["content"].str.strip() != ""].copy()
+    else:
+        # pas de contenu => aucune offre exploitable
+        new_df = new_df.iloc[0:0].copy()
 
     def update_id_lists(src, offer_id, score, is_good):
         if not offer_id or src not in platform_keys:
@@ -110,7 +178,7 @@ def merge_dataframes(progress_dict, stored_df, new_df, config):
 
     # --- Cas où le store est vide --- #
     if stored_df.empty:
-        if use_llm:
+        if use_llm and not new_df.empty:
             tqdm.pandas()
             new_df = new_df.progress_apply(
                 lambda row: add_LLM_comment(client, llm_config, row), axis=1
@@ -138,6 +206,11 @@ def merge_dataframes(progress_dict, stored_df, new_df, config):
 
     for _, new_row in new_df.iterrows():
         row = new_row.copy()
+
+        # sécurité : aucune nouvelle offre sans description
+        if not str(row.get("content", "")).strip():
+            continue
+
         hash_val = str(row.get("hash", ""))
         link = str(row.get("link", ""))
         offer_id = row.get("offer_id")
@@ -180,6 +253,142 @@ def merge_dataframes(progress_dict, stored_df, new_df, config):
 
     return merged, config
 
+def merge_dataframes(progress_dict, stored_df, new_df, config):
+    """
+    Version safe: accepte new_df None / vide.
+    (Le reste de ta logique est inchangé.)
+    """
+
+    # --- SAFETY : new_df ne doit jamais être None ---
+    if new_df is None:
+        new_df = pd.DataFrame()
+    if not isinstance(new_df, pd.DataFrame):
+        new_df = pd.DataFrame()
+
+    # --- Préparation config / LLM --- #
+    use_llm = config.get("use_llm", False)
+    llm_config = config.get("llm", {})
+
+    id_whitelist = config.setdefault("id_whitelist", {})
+    id_blacklist = config.setdefault("id_blacklist", {})
+
+    platform_keys = ["wttj", "apec", "linkedin", "sp"]
+    for k in platform_keys:
+        id_whitelist.setdefault(k, [])
+        id_blacklist.setdefault(k, [])
+
+    blacklisted_ids = set()
+    for k in platform_keys:
+        blacklisted_ids.update(id_blacklist.get(k, []))
+
+    client = None
+    if use_llm:
+        if llm_config.get("provider") == "ChatGPT":
+            client = OpenAI(api_key=llm_config.get("gpt_api_key"))
+        elif llm_config.get("provider") == "Mistral":
+            client = Mistral(api_key=llm_config.get("mistral_api_key"))
+        elif llm_config.get("provider") == "Local":
+            client = None
+
+    # Prévenir toute mutation surprise de la source
+    new_df = new_df.copy()
+
+    # --- Nettoyage / filtrage de base sur les nouvelles offres --- #
+    if "offer_id" in new_df.columns:
+        new_df = new_df[~new_df["offer_id"].isin(blacklisted_ids)].copy()
+
+    if "content" in new_df.columns:
+        new_df["content"] = new_df["content"].fillna("").astype(str)
+        new_df = new_df[new_df["content"].str.strip() != ""].copy()
+    else:
+        new_df = new_df.iloc[0:0].copy()
+
+    def update_id_lists(src, offer_id, score, is_good):
+        if not offer_id or src not in platform_keys:
+            return
+        if not llm_config.get("generate_score"):
+            return
+
+        if score >= SCORE_THRESHOLD and is_good == 1:
+            if offer_id not in id_whitelist[src]:
+                id_whitelist[src].append(offer_id)
+            if offer_id in id_blacklist[src]:
+                id_blacklist[src].remove(offer_id)
+        elif score < SCORE_THRESHOLD and offer_id not in id_blacklist[src]:
+            id_blacklist[src].append(offer_id)
+
+    # --- Cas où le store est vide --- #
+    if stored_df.empty:
+        if use_llm and not new_df.empty:
+            tqdm.pandas()
+            new_df = new_df.progress_apply(
+                lambda row: add_LLM_comment(client, llm_config, row), axis=1
+            )
+
+            for _, row in new_df.iterrows():
+                update_id_lists(
+                    src=str(row.get("source", "")).lower(),
+                    offer_id=row.get("offer_id"),
+                    score=row.get("score", 0),
+                    is_good=row.get("is_good_offer", 0),
+                )
+
+        return new_df, config
+
+    # --- Filtrer les nouvelles lignes déjà présentes dans stored_df --- #
+    new_rows = []
+    existing_hashes = set(stored_df.get("hash", pd.Series([], dtype=str)).astype(str))
+    existing_links = set(stored_df.get("link", pd.Series([], dtype=str)).astype(str))
+    existing_offer_ids = set(
+        stored_df.get("offer_id", pd.Series([], dtype=str)).dropna().astype(str)
+    )
+
+    for _, new_row in new_df.iterrows():
+        row = new_row.copy()
+
+        if not str(row.get("content", "")).strip():
+            continue
+
+        hash_val = str(row.get("hash", ""))
+        link = str(row.get("link", ""))
+        offer_id = row.get("offer_id")
+        offer_id_str = str(offer_id) if pd.notna(offer_id) else None
+
+        if hash_val in existing_hashes or link in existing_links:
+            continue
+        if offer_id_str and offer_id_str in existing_offer_ids:
+            continue
+
+        new_rows.append(row)
+
+    # --- Scoring + alimentation white/black list --- #
+    for i, new_row in tqdm(
+        list(enumerate(new_rows)),
+        total=len(new_rows),
+        desc="Traitement des offres récupérées",
+    ):
+        if use_llm:
+            new_rows[i] = add_LLM_comment(client, llm_config, new_row)
+            progress_dict["Traitement des nouvelles offres (LLM)"] = (i + 1, len(new_rows))
+
+        row = new_rows[i]
+        update_id_lists(
+            src=str(row.get("source", "")).lower(),
+            offer_id=row.get("offer_id"),
+            score=row.get("score", 0),
+            is_good=row.get("is_good_offer", 0),
+        )
+
+    # --- Fusion finale avec le store --- #
+    if new_rows:
+        new_data = pd.DataFrame(new_rows)
+        merged = pd.concat([stored_df, new_data], ignore_index=True)
+    else:
+        merged = stored_df
+
+    return merged, config
+
+
 def save_data(df):
     data_file = os.getenv("JOB_DATA_FILE", "data/job.csv")
     data_dir = os.path.dirname(data_file) or "data"
@@ -201,8 +410,7 @@ def get_store_data():
     else:
         return pd.DataFrame(columns=["title", "content", "company", "link", "date"])
 
-@measure_time
-def update_store_data(progress_dict):
+
     """Scraping + fusion + scoring + filtrage des offres < seuil.
     Retourne (success: bool, error_message: str)."""
     try:
@@ -296,6 +504,88 @@ def update_store_data(progress_dict):
         return True, ""
     except Exception:
         import traceback
+        tb = traceback.format_exc()
+        print("✘ Erreur pendant update_store_data:")
+        print(tb)
+        return False, tb
+
+@measure_time
+def update_store_data(progress_dict):
+    """Scraping + fusion + scoring + filtrage. Retourne (success: bool, error_message: str)."""
+    try:
+        config_file = os.getenv("APP_CONFIG_FILE", "config.json")
+        with open(config_file, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        def _to_bool(v):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                return v.lower() in ("true", "1", "yes", "on")
+            if isinstance(v, (int, float)):
+                return v != 0
+            return False
+
+        launch_scrap = config.get("launch_scrap", {})
+        normalized_launch = {}
+        for key in ["wttj", "apec", "linkedin", "sp"]:
+            normalized_launch[key] = _to_bool(launch_scrap.get(key, False))
+        config["launch_scrap"] = normalized_launch
+
+        platform_map = {
+            "wttj": Platform.wttj,
+            "apec": Platform.apec,
+            "linkedin": Platform.linkedin,
+            "sp": Platform.sp,
+        }
+        active_platforms = [
+            platform_map[k].value
+            for k, active in normalized_launch.items()
+            if active
+        ]
+
+        print("[SCRAP] launch_scrap normalisé :", normalized_launch)
+        print("[SCRAP] Plateformes actives :", [cls.__name__ for cls in active_platforms])
+
+        if not active_platforms:
+            print("[SCRAP] Aucune plateforme sélectionnée, rien à faire.")
+            return True, ""
+
+        new_df = get_all_job(
+            progress_dict,
+            active_platforms,
+            config.get("use_multithreading", False),
+        )
+
+        # SAFETY : au cas où
+        if new_df is None or not isinstance(new_df, pd.DataFrame):
+            new_df = pd.DataFrame()
+
+        store_df = get_store_data()
+
+        merged_df, updated_config = merge_dataframes(
+            progress_dict,
+            store_df,
+            new_df,
+            config,
+        )
+
+        if "is_good_offer" in merged_df.columns and "score" in merged_df.columns:
+            before = len(merged_df)
+            merged_df = merged_df[
+                ~((merged_df["is_good_offer"] == 0) & (merged_df["score"] < SCORE_THRESHOLD))
+            ]
+            removed = before - len(merged_df)
+            if removed > 0:
+                print(f"Filtrage : {removed} offres supprimées (score < {SCORE_THRESHOLD}).")
+
+        save_data(merged_df)
+
+        with open(config_file, "w", encoding="utf-8") as f:
+            json.dump(updated_config, f, ensure_ascii=False, indent=2)
+
+        return True, ""
+    except Exception:
         tb = traceback.format_exc()
         print("✘ Erreur pendant update_store_data:")
         print(tb)

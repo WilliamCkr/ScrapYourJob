@@ -190,7 +190,13 @@ class ServicePublic(JobFinder):
                 print(f"ServicePublic : erreur récupération détail pour {link} : {e}")
                 return None
 
+            # ⬇⬇⬇ on ignore si c'est vide après nettoyage
+            if not description.strip():
+                print(f"ServicePublic : description vide pour {title}, offre ignorée.")
+                return None
+
             return title, comp, link, datetime, description
+
 
         detailed_jobs = parallel_map_offers(all_jobs, _fetch_detail, io_bound=True)
 
