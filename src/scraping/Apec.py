@@ -1,11 +1,10 @@
-import json
-import re
 import os
+import json
 import math
+from datetime import datetime
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.wait import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-import urllib.parse
 
 from scraping.JobFinder import JobFinder, generate_offer_id
 from scraping.utils import measure_time, create_driver, load_id_sets_for_platform
@@ -13,10 +12,9 @@ from scraping.utils import measure_time, create_driver, load_id_sets_for_platfor
 
 class Apec(JobFinder):
     """
-    Scraper Apec multi-pages :
-    - lit l’URL dans config.json (ou APP_CONFIG_FILE)
-    - récupère le nombre total d’offres (ex: 330)
-    - boucle sur toutes les pages ?page=0,1,2,... jusqu’au bout
+    Scraper Apec (Selenium).
+    Convention:
+    - fetch_detail(url) -> {"title":..., "description":...} ou None
     """
 
     def __init__(self):
@@ -25,205 +23,192 @@ class Apec(JobFinder):
         self.get_config()
 
     def get_config(self):
-        """
-        Exemple d’URL dans le config :
-        https://www.apec.fr/candidat/recherche-emploi.html/emploi?typesConvention=...&lieux=75&motsCles=CRM&page=0
-        On la transforme en template avec deux placeholders :
-        - motsCles={keywords}
-        - page={page}
-        """
         config_file = os.getenv("APP_CONFIG_FILE", "config.json")
-        with open(config_file, 'r', encoding="utf-8") as f:
+        with open(config_file, "r", encoding="utf-8") as f:
             config = json.load(f)
 
-        self.keywords = config.get('keywords', [])
+        self.keywords = config.get("keywords", [])
+        raw_url = config.get("url", {}).get("apec", "").strip()
+        if not raw_url:
+            self.base_url = ""
+            return
 
-        raw_url = config['url']['apec']
+        # on force placeholders {keywords} et {page} si besoin
+        if "{keywords}" not in raw_url:
+            raw_url = raw_url.replace("keywords=", "keywords={keywords}")
+        if "page=" not in raw_url:
+            raw_url += "&page={page}"
+        self.base_url = raw_url
 
-        # motsCles -> motsCles={keywords}
-        url_kw = re.sub(r'motsCles=[^&]*', 'motsCles={keywords}', raw_url)
+    def _empty_df(self):
+        return self.formatData("apec", [], [], [], [], [])
 
-        # page=0 -> page={page}
-        url_kw_page = re.sub(r'page=\d+', 'page={page}', url_kw)
-
-        self.base_url = url_kw_page
-
-    def build_keywords(self):
-        joined_keywords = " OR ".join(self.keywords)
-        return urllib.parse.quote(joined_keywords)
-
-    @measure_time
-    def getJob(self, update_callback=None):
+    # ------------------------------
+    # Convention: fetch_detail(url)
+    # ------------------------------
+    def fetch_detail(self, url: str) -> dict | None:
         driver = create_driver()
-        keyword = self.build_keywords()
-
-        # 1) Charger la première page pour récupérer le nombre total d’offres
-        first_url = self.base_url.format(keywords=keyword, page=0)
-        print(f"APEC : page {first_url}")
-        driver.get(first_url)
-
-        # Fermer la bannière cookies si présente
-        self._close_cookies(driver)
-
-        # Récupérer le nombre total d’offres (ex: 330)
         try:
-            nb_span = WebDriverWait(driver, 5).until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, ".number-candidat span")
-                )
-            )
-            total_offers_text = nb_span.text.replace("\xa0", "").replace(" ", "")
-            total_offers = int(total_offers_text)
-        except Exception as e:
-            print(f"APEC : impossible de lire le nombre total d’offres, fallback à 20. Erreur: {e}")
-            total_offers = 20
-
-        # Apec affiche 20 offres par page
-        page_size = 20
-        total_pages = max(1, math.ceil(total_offers / page_size))
-        print(f"APEC : {total_offers} offres détectées, {total_pages} page(s).")
-
-        # 2) Collecter tous les jobs de toutes les pages
-        all_jobs = []
-
-        for page in range(total_pages):
-            url = self.base_url.format(keywords=keyword, page=page)
-            print(f"APEC : chargement de la page {page + 1}/{total_pages} -> {url}")
             driver.get(url)
 
-            # bannière cookies éventuellement sur la 1ère page surtout
+            # titre
+            try:
+                title_el = WebDriverWait(driver, 6).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "h1"))
+                )
+                title = title_el.text.strip()
+            except Exception:
+                title = ""
+
+            # description
+            try:
+                job_description_element = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.XPATH, "//div[@class='col-lg-8 border-L']"))
+                )
+                description = job_description_element.text.strip()
+            except Exception:
+                description = ""
+
+            if not description:
+                return None
+
+            return {"title": title or "", "description": description}
+        finally:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+    def _close_cookies(self, driver):
+        try:
+            btn = WebDriverWait(driver, 2).until(
+                EC.element_to_be_clickable((By.ID, "onetrust-reject-all-handler"))
+            )
+            btn.click()
+        except Exception:
+            pass
+
+    @measure_time
+    def getJob(self, update_callback=None, cache=None, profile_id: str = ""):
+        if not self.base_url or not self.keywords:
+            print("APEC : config incomplète, scraping ignoré.")
+            return self._empty_df()
+
+        # fallback legacy sets si pas de cache
+        blacklist_ids, whitelist_ids, known_offer_ids = set(), set(), set()
+        if cache is None:
+            try:
+                blacklist_ids, whitelist_ids, known_offer_ids = load_id_sets_for_platform("apec")
+            except Exception:
+                pass
+
+        driver = create_driver()
+        all_jobs = []
+
+        try:
+            keyword = self.keywords[0]  # Apec url déjà construite pour le profil
+            # page 0 pour détecter total
+            first_url = self.base_url.format(keywords=keyword, page=0)
+            driver.get(first_url)
             self._close_cookies(driver)
 
+            # total offers (best effort)
+            total_offers = 0
             try:
-                offer_elements = WebDriverWait(driver, 5).until(
-                    EC.presence_of_all_elements_located(
-                        (By.CSS_SELECTOR, "a[queryparamshandling='merge']")
-                    )
+                total_el = WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "span[data-cy='count-results']"))
                 )
-            except Exception as e:
-                print(f"APEC : aucune offre détectée sur la page {page + 1} ({e}), on continue.")
-                continue
+                txt = total_el.text.strip().replace(" ", "")
+                total_offers = int("".join([c for c in txt if c.isdigit()]) or 0)
+            except Exception:
+                total_offers = 0
 
-            for offer in offer_elements:
+            # pages estimées (20/page)
+            per_page = 20
+            total_pages = max(1, math.ceil(total_offers / per_page)) if total_offers else 30
+
+            seen = set()
+            for page in range(total_pages):
+                url = self.base_url.format(keywords=keyword, page=page)
+                driver.get(url)
+                self._close_cookies(driver)
+
                 try:
-                    job_link = offer.get_attribute("href")
-
-                    job_title_el = offer.find_element(By.CSS_SELECTOR, "h2.card-title")
-                    job_title = job_title_el.text.strip()
-
-                    company_el = offer.find_element(
-                        By.CSS_SELECTOR, "p.card-offer__company"
-                    )
-                    company_name = company_el.text.strip()
-
-                    datetime_el = offer.find_element(
-                        By.XPATH, ".//li[@title='Date de publication']"
-                    )
-                    datetime_txt = datetime_el.text.strip()
-
-                    if job_title and company_name and job_link:
-                        all_jobs.append(
-                            (job_title, company_name, job_link, datetime_txt)
+                    offer_elements = WebDriverWait(driver, 5).until(
+                        EC.presence_of_all_elements_located(
+                            (By.CSS_SELECTOR, "a[queryparams]")
                         )
-                except Exception as e:
-                    print(f"APEC : erreur parsing d’une offre sur la page {page + 1} : {e}")
+                    )
+                except Exception:
+                    offer_elements = []
+
+                if not offer_elements:
+                    # stop si pages vides répétées
+                    if page > 2:
+                        break
                     continue
 
-        # --- Filtrage avec white/black lists + offres déjà connues --- #
-        config_path = os.getenv("APP_CONFIG_FILE", "config.json")
-        csv_path = os.getenv("JOB_DATA_FILE", "data/job.csv")
+                for a in offer_elements:
+                    link = a.get_attribute("href") or ""
+                    link = link.split("?")[0]
+                    if not link or link in seen:
+                        continue
 
-        blacklisted_ids, whitelisted_ids, known_ids = load_id_sets_for_platform(
-            config_path=config_path,
-            csv_path=csv_path,
-            platform_key="apec",
-        )
+                    title = a.text.strip() or ""
+                    comp = ""
+                    datetime_txt = ""
 
-        filtered_jobs = []
-        for (title, comp, link, datetime_txt) in all_jobs:
-            offer_id = generate_offer_id("apec", link)
+                    offer_id = generate_offer_id("apec", link)
 
-            # Blacklist : on skip
-            if offer_id in blacklisted_ids:
-                continue
+                    if cache is not None:
+                        if cache.exists(offer_id):
+                            continue
+                        cache.upsert_url(offer_id, "apec", link, "PENDING_URL")
+                    else:
+                        if offer_id in blacklist_ids or offer_id in whitelist_ids or offer_id in known_offer_ids:
+                            continue
 
-            # Offres déjà connues (CSV) et pas whitelistées : on skip
-            if offer_id in known_ids and offer_id not in whitelisted_ids:
-                continue
+                    seen.add(link)
+                    all_jobs.append((title, comp, link, datetime_txt, offer_id))
 
-            filtered_jobs.append((title, comp, link, datetime_txt))
+                if update_callback:
+                    update_callback(len(all_jobs), max(len(all_jobs), 1), page + 1, total_pages)
 
-        all_jobs = filtered_jobs
-        print(f"Nombre de fiches APEC collectées (après filtres) : {len(all_jobs)}")
-
-        # 3) Détail de chaque offre
-        list_title = []
-        list_content = []
-        list_company = []
-        list_link = []
-        list_datetime = []
-
-        total = len(all_jobs)
-        for i, (title, comp, link, datetime_txt) in enumerate(all_jobs):
+        finally:
             try:
-                driver.get(link)
+                driver.quit()
+            except Exception:
+                pass
 
-                job_description_element = WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located(
-                        (By.XPATH, "//div[@class='col-lg-8 border-L']")
-                    )
-                )
-                job_description = job_description_element.text
-            except Exception as e:
-                print(f"APEC : erreur lors de la récupération du détail {link} : {e}")
-                job_description = ""
+        if not all_jobs:
+            return self._empty_df()
 
-            # ⬇⬇⬇ on skip si pas de description exploitable
-            if not job_description.strip():
-                print(f"APEC : description vide pour {link}, offre ignorée.")
+        # détails (séquentiel, selenium)
+        list_title, list_content, list_company, list_link, list_datetime = [], [], [], [], []
+        total = len(all_jobs)
+
+        for i, (title, comp, link, datetime_txt, offer_id) in enumerate(all_jobs):
+            d = self.fetch_detail(link)
+            if not d:
+                if update_callback:
+                    update_callback(i + 1, total)
                 continue
 
-            list_title.append(title)
-            list_content.append(job_description)
+            final_title = d.get("title") or title or ""
+            desc = d.get("description") or ""
+
+            if cache is not None:
+                cache.upsert_detail(offer_id, "apec", link, final_title, desc, status="DETAILED")
+
+            list_title.append(final_title)
+            list_content.append(desc)
             list_company.append(comp)
             list_link.append(link)
             list_datetime.append(datetime_txt)
 
-            print(f"APEC {i + 1}/{total}")
             if update_callback:
                 update_callback(i + 1, total)
 
-        driver.quit()
-
-        df = self.formatData(
-            "apec", list_title, list_content, list_company, list_link, list_datetime
-        )
+        df = self.formatData("apec", list_title, list_content, list_company, list_link, list_datetime)
         df = df.drop_duplicates(subset="hash", keep="first")
         return df
-
-
-    def _close_cookies(self, driver):
-        """Ferme la bannière cookies si présente."""
-        try:
-            cookie_banner = WebDriverWait(driver, 2).until(
-                EC.element_to_be_clickable((By.ID, "onetrust-reject-all-handler"))
-            )
-            driver.execute_script(
-                "arguments[0].scrollIntoView({block: 'center'});",
-                cookie_banner,
-            )
-            cookie_banner = WebDriverWait(driver, 2).until(
-                EC.element_to_be_clickable((By.ID, "onetrust-reject-all-handler"))
-            )
-            cookie_banner.click()
-            print("APEC : bannière de cookies fermée.")
-        except Exception:
-            # Pas grave si elle n’est pas là
-            pass
-
-
-if __name__ == "__main__":
-    APC = Apec()
-    df = APC.getJob()
-    df = df.sort_values(by="date", ascending=False)
-    print(df.head())

@@ -4,15 +4,8 @@ import os
 import json
 import re
 from datetime import datetime, timezone
+from application.all_pages_app import all_pages_app
 
-from application.all_pages_app import (
-    scrapping_page,
-    new_offer_page,
-    offer_readed_page,
-    offer_applied_page,
-    offer_refused_page,
-    category_analysis_page,
-)
 
 # Fichier de définition des profils (à la racine)
 PROFILES_FILE = ".profiles.json"
@@ -330,40 +323,4 @@ def load_data():
     return df
 
 
-# ---------- Navigation ---------- #
-
-
-st.sidebar.markdown("---")
-st.sidebar.title("Navigation")
-
-page = st.sidebar.radio(
-    "Choisissez une page :",
-    (
-        "Scraping d'offres",
-        "Nouvelles offres",
-        "Offres déjà lues",
-        "Candidatures en cours",
-        "Candidatures refusées",
-        "Analyse IA avancée",
-    ),
-)
-
-df = load_data()
-
-if page == "Scraping d'offres":
-    scrapping_page()
-
-elif page == "Nouvelles offres":
-    new_offer_page(df)
-
-elif page == "Offres déjà lues":
-    offer_readed_page(df)
-
-elif page == "Candidatures en cours":
-    offer_applied_page(df)
-
-elif page == "Candidatures refusées":
-    offer_refused_page(df)
-
-elif page == "Analyse IA avancée":
-    category_analysis_page(df)
+all_pages_app()

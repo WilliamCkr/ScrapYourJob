@@ -2,9 +2,10 @@
 import os
 import json
 import re
-from bs4 import BeautifulSoup
 import urllib.parse
+
 import dateparser
+from bs4 import BeautifulSoup
 
 from scraping.JobFinder import JobFinder, generate_offer_id
 from scraping.utils import measure_time, parallel_map_offers, load_id_sets_for_platform
@@ -13,9 +14,10 @@ from scraping.utils import measure_time, parallel_map_offers, load_id_sets_for_p
 class ServicePublic(JobFinder):
     """
     Scraper choisirleservicepublic.gouv.fr
-    Lit la config via APP_CONFIG_FILE (sinon config.json) et utilise :
-      - config['keywords'] : liste de mots-clés
-      - config['url']['sp'] : URL modèle contenant 'mot-cles/<quelque chose>'
+
+    Supporte maintenant:
+    - cache (OfferCache) pour alimenter les compteurs UI (PENDING_URL / DETAILED / SCORED_*)
+    - update_callback(offres_cur, offres_total, pages_cur, pages_total) pour afficher les pages
     """
 
     def __init__(self):
@@ -38,9 +40,7 @@ class ServicePublic(JobFinder):
 
         if not raw_url:
             self.url_template = None
-            print(
-                f"ServicePublic : aucune URL définie dans {config_file}, scraping ignoré."
-            )
+            print(f"ServicePublic : aucune URL définie dans {config_file}, scraping ignoré.")
             return
 
         # Remplace mot-cles/<quelque-chose> par mot-cles/{}
@@ -60,7 +60,7 @@ class ServicePublic(JobFinder):
         return date_obj.strftime("%Y-%m-%d") if date_obj else ""
 
     @measure_time
-    def getJob(self, update_callback=None):
+    def getJob(self, update_callback=None, cache=None, profile_id: str = ""):
         if not self.url_template:
             print("ServicePublic : URL non configurée, retour DataFrame vide.")
             return self._empty_df()
@@ -72,10 +72,24 @@ class ServicePublic(JobFinder):
         keywords = self.build_keywords()
         base_url = self.url_template.format(keywords)
 
-        # --- 1) Récupérer nb de pages ---
-        res = self.get_content(base_url)
-        soup = BeautifulSoup(res.text, "html.parser")
+        # fallback legacy sets si pas de cache
+        blacklisted_ids, whitelisted_ids, known_ids = set(), set(), set()
+        if cache is None:
+            config_path = os.getenv("APP_CONFIG_FILE", "config.json")
+            csv_path = os.getenv("JOB_DATA_FILE", "data/job.csv")
+            try:
+                blacklisted_ids, whitelisted_ids, known_ids = load_id_sets_for_platform(
+                    config_path=config_path,
+                    csv_path=csv_path,
+                    platform_key="sp",
+                )
+            except Exception:
+                pass
+
+        # --- 1) Récupérer nb de pages (best effort) ---
         try:
+            res = self.get_content(base_url)
+            soup = BeautifulSoup(res.text, "html.parser")
             pages = soup.select("ul.fr-pagination__list a.fr-pagination__link")
             page_numbers = [
                 int(a.get_text(strip=True))
@@ -87,30 +101,43 @@ class ServicePublic(JobFinder):
             last_page = 1
 
         # --- 2) Récupérer toutes les offres sur toutes les pages ---
-        all_jobs = []
+        all_jobs = []  # (title, comp, link, dt, offer_id)
+        seen_links = set()
+
         for i in range(last_page):
-            page_url = base_url + f"page/{i + 1}"
-            print(f"ServicePublic : page {i + 1}/{last_page} -> {page_url}")
+            page_num = i + 1
+            page_url = base_url.rstrip("/") + f"/page/{page_num}"
 
             try:
                 res = self.get_content(page_url)
             except Exception as e:
-                print(f"ServicePublic : erreur requête page {i+1} : {e}")
+                print(f"ServicePublic : erreur requête page {page_num} : {e}")
+                # update pages quand même
+                if update_callback:
+                    update_callback(len(all_jobs), max(len(all_jobs), 1), page_num, last_page)
                 continue
 
             soup = BeautifulSoup(res.text, "html.parser")
-            offers = soup.select("div.fr-col-12.item")
+            offers = soup.select("li.fr-col-12.item")
 
             for offer in offers:
                 try:
                     link_el = offer.select_one("a.is-same-domain")
                     if not link_el:
                         continue
-                    job_link = link_el["href"]
+
+                    job_link = link_el.get("href", "")
+                    if not job_link:
+                        continue
+
                     if not job_link.startswith("http"):
                         job_link = urllib.parse.urljoin(base_url, job_link)
 
-                    job_title = link_el.get_text(strip=True)
+                    job_link = job_link.split("?")[0].strip()
+                    if not job_link or job_link in seen_links:
+                        continue
+
+                    job_title = link_el.get_text(strip=True) or ""
 
                     ministere_el = offer.select_one("img.fr-responsive-img")
                     job_ministere = ministere_el.get("alt").strip() if ministere_el else ""
@@ -119,84 +146,79 @@ class ServicePublic(JobFinder):
                     raw_date = date_el.get_text(strip=True) if date_el else ""
                     job_datetime = self.parse_date(raw_date) if raw_date else ""
 
-                    all_jobs.append(
-                        (job_title, job_ministere, job_link, job_datetime)
-                    )
+                    offer_id = generate_offer_id("sp", job_link)
+
+                    # Cache mode
+                    if cache is not None:
+                        if cache.exists(offer_id):
+                            continue
+                        cache.upsert_url(offer_id, "sp", job_link, "PENDING_URL")
+                    else:
+                        # Legacy filter mode
+                        if offer_id in blacklisted_ids:
+                            continue
+                        if offer_id in known_ids and offer_id not in whitelisted_ids:
+                            continue
+
+                    seen_links.add(job_link)
+                    all_jobs.append((job_title, job_ministere, job_link, job_datetime, offer_id))
+
                 except Exception as e:
                     print(f"ServicePublic : erreur lecture offre : {e}")
+
+            # callback pages + offers (total inconnu à ce stade)
+            if update_callback:
+                update_callback(len(all_jobs), max(len(all_jobs), 1), page_num, last_page)
 
         if not all_jobs:
             print("ServicePublic : aucune offre trouvée.")
             return self._empty_df()
 
-        print(
-            f"Nombre de fiches de poste du Service Public récupérées (brut) : {len(all_jobs)}"
-        )
+        print(f"ServicePublic : fiches récupérées (après filtres/cache) : {len(all_jobs)}")
 
-        # --- 3) Filtrage via white/black list + offres déjà connues ---
-        config_path = os.getenv("APP_CONFIG_FILE", "config.json")
-        csv_path = os.getenv("JOB_DATA_FILE", "data/job.csv")
-
-        blacklisted_ids, whitelisted_ids, known_ids = load_id_sets_for_platform(
-            config_path=config_path,
-            csv_path=csv_path,
-            platform_key="sp",
-        )
-
-        filtered_jobs = []
-        for title, comp, link, datetime in all_jobs:
-            offer_id = generate_offer_id("sp", link)
-
-            # Blacklist : on skip
-            if offer_id in blacklisted_ids:
-                continue
-
-            # Offres déjà connues et pas whitelistées : on skip
-            if offer_id in known_ids and offer_id not in whitelisted_ids:
-                continue
-
-            filtered_jobs.append((title, comp, link, datetime, offer_id))
-
-        all_jobs = filtered_jobs
-        if not all_jobs:
-            print(
-                "ServicePublic : aucune nouvelle offre à récupérer après application des listes."
-            )
-            return self._empty_df()
-
-        print(
-            f"ServicePublic : nombre d'offres à récupérer après filtres : {len(all_jobs)}"
-        )
-
-        # --- 4) Récupération du détail des offres en parallèle (HTTP) ---
+        # --- 3) Récupération du détail des offres en parallèle (HTTP) ---
         def _fetch_detail(job):
-            title, comp, link, datetime, offer_id = job
+            title, comp, link, dt, offer_id = job
             description = ""
             try:
                 res = self.get_content(link)
                 soup = BeautifulSoup(res.text, "html.parser")
                 target_div = soup.find(
                     "div",
-                    class_=lambda x: x is not None
-                    and "col-left" in x.split()
-                    and "rte" in x.split(),
+                    class_=lambda x: x is not None and "col-left" in x.split() and "rte" in x.split(),
                 )
                 if target_div:
                     description = target_div.get_text(" ", strip=True)
                 else:
                     print(f"ServicePublic : aucune description pour {title}, skip.")
+                    if cache is not None:
+                        cache.mark_error(offer_id, status="ERROR_DETAIL")
                     return None
             except Exception as e:
                 print(f"ServicePublic : erreur récupération détail pour {link} : {e}")
+                if cache is not None:
+                    cache.mark_error(offer_id, status="ERROR_DETAIL")
                 return None
 
-            # ⬇⬇⬇ on ignore si c'est vide après nettoyage
             if not description.strip():
                 print(f"ServicePublic : description vide pour {title}, offre ignorée.")
+                if cache is not None:
+                    cache.mark_error(offer_id, status="ERROR_DETAIL")
                 return None
 
-            return title, comp, link, datetime, description
+            final_title = title or ""
 
+            if cache is not None:
+                cache.upsert_detail(
+                    offer_id=offer_id,
+                    source="sp",
+                    url=link,
+                    title=final_title,
+                    description=description,
+                    status="DETAILED",
+                )
+
+            return final_title, comp, link, dt, description, offer_id
 
         detailed_jobs = parallel_map_offers(all_jobs, _fetch_detail, io_bound=True)
 
@@ -204,21 +226,25 @@ class ServicePublic(JobFinder):
             print("ServicePublic : aucun détail d'offre récupéré.")
             return self._empty_df()
 
-        list_title = [t for (t, c, l, d, desc) in detailed_jobs]
-        list_company = [c for (t, c, l, d, desc) in detailed_jobs]
-        list_link = [l for (t, c, l, d, desc) in detailed_jobs]
-        list_datetime = [d for (t, c, l, d, desc) in detailed_jobs]
-        list_content = [desc for (t, c, l, d, desc) in detailed_jobs]
+        # callback final: offres_tot = offres_cur
+        if update_callback:
+            update_callback(len(detailed_jobs), len(detailed_jobs), last_page, last_page)
 
-        total = len(detailed_jobs)
-        for i in range(total):
-            print(f"Service Public {i + 1}/{total}")
-            if update_callback:
-                update_callback(i + 1, total)
+        list_title = [t for (t, c, l, d, desc, oid) in detailed_jobs]
+        list_company = [c for (t, c, l, d, desc, oid) in detailed_jobs]
+        list_link = [l for (t, c, l, d, desc, oid) in detailed_jobs]
+        list_datetime = [d for (t, c, l, d, desc, oid) in detailed_jobs]
+        list_content = [desc for (t, c, l, d, desc, oid) in detailed_jobs]
 
-        df = self.formatData(
-            "sp", list_title, list_content, list_company, list_link, list_datetime
-        )
+        df = self.formatData("sp", list_title, list_content, list_company, list_link, list_datetime)
+
+        # on garde les offer_id calculés (formatData regénère, donc on override)
+        try:
+            df["offer_id"] = [oid for (t, c, l, d, desc, oid) in detailed_jobs]
+            df["source"] = "sp"
+        except Exception:
+            pass
+
         df = df.drop_duplicates(subset="hash", keep="first")
         return df
 
