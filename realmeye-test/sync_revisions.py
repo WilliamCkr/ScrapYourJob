@@ -120,7 +120,7 @@ def table_rows(html):
             raise ValueError("Incomplete HTML row " + str(idx))
         page = clean(cells[0]["text"])
         revision_text = clean(cells[1]["text"])
-        matched = re.match(r"^(\\d+)", revision_text)
+        matched = re.match(r"^([0-9]+)", revision_text)
         if not page or not matched:
             raise ValueError("Invalid page or revision at HTML row " + str(idx))
         revision = str(int(matched.group(1)))
@@ -188,7 +188,7 @@ def main():
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     temp = OUTPUT.with_suffix(".csv.tmp")
     with temp.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=HEADERS, lineterminator="\\n")
+        writer = csv.DictWriter(stream, fieldnames=HEADERS, lineterminator=chr(10))
         writer.writeheader()
         writer.writerows(existing + additions)
     temp.replace(OUTPUT)
