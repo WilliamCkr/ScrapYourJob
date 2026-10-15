@@ -59,6 +59,10 @@ def main():
     html = fetch(PAGE)
     reader = TableReader()
     reader.feed(html)
+    # Inspect two public table rows to learn how comments and revision links are encoded.
+    import re
+    for row_html in re.findall(r"<tr\\b[^>]*>[\\s\\S]*?</tr>", html, flags=re.IGNORECASE)[:3]:
+        print("RAW HTML ROW:", row_html[:2800].replace("\\n", " "))
     print("HTML table count:", len(reader.tables))
     for number, rows in enumerate(reader.tables):
         print("Table", number, "row count:", len(rows))
