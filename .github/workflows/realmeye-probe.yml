@@ -1,0 +1,24 @@
+name: RealmEye connection test
+on:
+  push:
+    branches:
+      - realmeye-sync-20261015
+    paths:
+      - .github/workflows/realmeye-probe.yml
+      - realmeye-test/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Read RealmEye recent changes (no Google Sheets write)
+        run: python realmeye-test/probe.py
