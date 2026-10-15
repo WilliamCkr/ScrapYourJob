@@ -136,9 +136,16 @@ def table_rows(html):
             for href in cells[1]["links"]
             if "/compare-revisions-of-wiki-page/" in href
         ]
-        if len(compare) > 1:
-            raise ValueError("Ambiguous diff URL at HTML row " + str(idx))
-        diff = compare[0] if compare else ""
+        previous_pair = "/" + str(int(revision) - 1) + "/" + revision
+        prior_diffs = [
+            url for url in compare
+            if urlparse(url).path.rstrip("/").endswith(previous_pair)
+        ]
+        if len(prior_diffs) > 1:
+            raise ValueError("Duplicate previous-revision links at HTML row " + str(idx))
+        if compare and int(revision) > 1 and not prior_diffs:
+            raise ValueError("Previous-revision diff not found at HTML row " + str(idx))
+        diff = prior_diffs[0] if prior_diffs else ""
         if diff:
             parsed = urlparse(diff)
             if parsed.scheme != "https" or parsed.netloc != "www.realmeye.com":
