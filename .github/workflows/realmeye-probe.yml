@@ -6,6 +6,12 @@ on:
     paths:
       - .github/workflows/realmeye-probe.yml
       - realmeye-test/**
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/realmeye-probe.yml
+      - realmeye-test/**
   workflow_dispatch:
 
 permissions:
