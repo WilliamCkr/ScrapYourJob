@@ -1,0 +1,66 @@
+name: RealmEye wiki revisions CSV
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/realmeye-sync.yml
+      - realmeye-test/sync_revisions.py
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/realmeye-sync.yml
+      - realmeye-test/sync_revisions.py
+  schedule:
+    - cron: '49 */2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: realmeye-wiki-revisions
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate live RealmEye rows and extract full comments
+        run: python realmeye-test/sync_revisions.py
+      - name: Attach recovered revisions CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: realmeye-revisions-review
+          path: realmeye-test/data/revisions.csv
+          if-no-files-found: error
+
+  update-csv:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Extract live RealmEye revisions and update CSV
+        run: python realmeye-test/sync_revisions.py
+      - name: Commit only if new revisions exist
+        run: |
+          git add realmeye-test/data/revisions.csv
+          if git diff --cached --quiet; then
+            echo "No new revisions; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "data: archive new RealmEye wiki revisions"
+          git push origin HEAD:main
