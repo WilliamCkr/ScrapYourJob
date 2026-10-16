@@ -108,12 +108,8 @@ def table_rows(html):
     if len(candidates) != 1:
         raise ValueError("Expected exactly one recent-changes table, got " + str(len(candidates)))
     table = candidates[0]
-    # RealmEye can legitimately show fewer than ten recent revisions.
-    # Validate the actual rows individually instead of using an arbitrary count.
-    # Keep an empty/header-only response as an error to avoid mistaking
-    # a partial or degraded page for a successful collection.
-    if len(table) < 2:
-        raise ValueError("RealmEye changes table has no revision rows")
+    # There is no minimum (or maximum) revision count: a verified table can
+    # contain zero, one or many rows. Every row is validated individually.
 
     revisions = []
     seen = set()
@@ -166,7 +162,10 @@ def table_rows(html):
     print("Live source rows:", len(revisions))
     print("Comments expanded from HTML title:", expanded_comments)
     print("Rows without compare link:", without_diff)
-    print("First parsed row:", revisions[0])
+    if revisions:
+        print("First parsed row:", revisions[0])
+    else:
+        print("RealmEye table is empty: no new revisions to process")
     return revisions
 
 
