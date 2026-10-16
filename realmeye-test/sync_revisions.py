@@ -108,8 +108,12 @@ def table_rows(html):
     if len(candidates) != 1:
         raise ValueError("Expected exactly one recent-changes table, got " + str(len(candidates)))
     table = candidates[0]
-    if len(table) < 11:
-        raise ValueError("Too few table rows to confirm complete extraction: " + str(len(table)))
+    # RealmEye can legitimately show fewer than ten recent revisions.
+    # Validate the actual rows individually instead of using an arbitrary count.
+    # Keep an empty/header-only response as an error to avoid mistaking
+    # a partial or degraded page for a successful collection.
+    if len(table) < 2:
+        raise ValueError("RealmEye changes table has no revision rows")
 
     revisions = []
     seen = set()
